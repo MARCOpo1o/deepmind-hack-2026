@@ -1,0 +1,5 @@
+{
+  "name": "ScoreVision AI",
+  "description": "An AI-powered sports video analyst that automatically detects scoring moments and generates an interactive highlight timeline using Gemini 3.",
+  "requestFramePermissions": []
+}
