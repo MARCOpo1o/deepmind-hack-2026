@@ -1,7 +1,8 @@
 
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { analyzeVideo, queryVideo } from './services/geminiService.ts';
-import { Highlight, AnalysisStatus, AnalysisResult, HistoryItem } from './types.ts';
+import { analyzeVideo } from './services/geminiService.ts';
+import { Highlight, AnalysisStatus, AnalysisResult, HistoryItem, GalleryItem } from './types.ts';
+import { getGallery, saveToGallery, removeFromGallery } from './services/db.ts';
 import Timeline from './components/Timeline.tsx';
 import HighlightCard from './components/HighlightCard.tsx';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
@@ -10,56 +11,55 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 const CACHE_KEY = 'scorevision_history_v1';
 
 const App: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<'analysis' | 'gallery'>('analysis');
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [status, setStatus] = useState<AnalysisStatus>(AnalysisStatus.IDLE);
   const [results, setResults] = useState<AnalysisResult | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [gallery, setGallery] = useState<GalleryItem[]>([]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [clippingProgress, setClippingProgress] = useState(0);
   const [targetJersey, setTargetJersey] = useState<string>('');
-  
-  const [userQuery, setUserQuery] = useState('');
-  const [queryResponse, setQueryResponse] = useState<string | null>(null);
-  const [isQuerying, setIsQuerying] = useState(false);
   const [hasKey, setHasKey] = useState(false);
+  const [clippingSupported, setClippingSupported] = useState<boolean | null>(null);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<any>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
 
-  // Load History on mount
   useEffect(() => {
-    // Use window.localStorage to fix 'Cannot find name localStorage' error
-    const saved = window.localStorage.getItem(CACHE_KEY);
-    if (saved) {
-      try {
-        setHistory(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to parse history", e);
-      }
+    const savedHistory = localStorage.getItem(CACHE_KEY);
+    if (savedHistory) {
+      try { setHistory(JSON.parse(savedHistory)); } catch (e) { console.error(e); }
     }
+
+    const loadGalleryItems = async () => {
+      try {
+        const items = await getGallery();
+        const itemsWithUrls = items.map(item => ({
+          ...item,
+          clipUrl: item.clipBlob ? URL.createObjectURL(item.clipBlob) : undefined
+        }));
+        setGallery(itemsWithUrls);
+      } catch (e) { console.error("Gallery Load Error:", e); }
+    };
+    loadGalleryItems();
 
     const checkKey = async () => {
       if ((window as any).aistudio?.hasSelectedApiKey) {
         try {
           const selected = await (window as any).aistudio.hasSelectedApiKey();
           setHasKey(selected);
-        } catch (e) {
-          setHasKey(false);
-        }
-      } else {
-        setHasKey(true);
-      }
+        } catch (e) { setHasKey(false); }
+      } else { setHasKey(true); }
     };
     checkKey();
   }, []);
 
-  // Save history when it changes
   useEffect(() => {
-    // Use window.localStorage to fix 'Cannot find name localStorage' error
-    window.localStorage.setItem(CACHE_KEY, JSON.stringify(history));
+    localStorage.setItem(CACHE_KEY, JSON.stringify(history));
   }, [history]);
 
   const getFileId = (file: File) => `${file.name}-${file.size}-${file.lastModified}`;
@@ -67,72 +67,85 @@ const App: React.FC = () => {
   const filteredHighlights = useMemo(() => {
     if (!results) return [];
     if (!targetJersey.trim()) return results.highlights;
-    return results.highlights.filter(h => 
-      h.playerJerseyNumber?.toLowerCase() === targetJersey.trim().toLowerCase()
-    );
+    return results.highlights.filter(h => h.playerJerseyNumber?.toLowerCase().includes(targetJersey.trim().toLowerCase()));
   }, [results, targetJersey]);
+
+  const filteredGallery = useMemo(() => {
+    if (!targetJersey.trim()) return gallery;
+    return gallery.filter(h => h.playerJerseyNumber?.toLowerCase().includes(targetJersey.trim().toLowerCase()));
+  }, [gallery, targetJersey]);
 
   const loadFFmpeg = async () => {
     if (ffmpegRef.current) return ffmpegRef.current;
+    
     const ffmpeg = new FFmpeg();
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-    });
-    ffmpegRef.current = ffmpeg;
-    return ffmpeg;
+    
+    try {
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
+      });
+      ffmpegRef.current = ffmpeg;
+      setClippingSupported(true);
+      return ffmpeg;
+    } catch (err) {
+      console.warn("[ScoreVision] Video engine disabled: Browser security restricts SharedArrayBuffer.");
+      setClippingSupported(false);
+      return null;
+    }
   };
 
   const generateClips = async (analysis: AnalysisResult, file: File) => {
     if (!analysis.highlights.length) return analysis;
+    
+    const ffmpeg = await loadFFmpeg();
+    if (!ffmpeg) return analysis; // Silently skip clipping if engine is blocked
+
     setStatus(AnalysisStatus.CLIPPING);
     setClippingProgress(0);
+
+    const isAudioOnly = file.type.startsWith('audio/') || file.name.endsWith('.mp3');
+    const extension = file.name.split('.').pop() || 'mp4';
+    const inputFileName = `input.${extension}`;
+
     try {
-      console.log("[FFmpeg] Initializing clip engine...");
-      const ffmpeg = await loadFFmpeg();
-      await ffmpeg.writeFile('input.mp4', await fetchFile(file));
-      
+      await ffmpeg.writeFile(inputFileName, await fetchFile(file));
       const updatedHighlights = [...analysis.highlights];
+      
       for (let i = 0; i < updatedHighlights.length; i++) {
         const h = updatedHighlights[i];
-        // Clip 5 seconds before score and 3 seconds after
         const start = Math.max(0, h.timestampSeconds - 5);
-        const clipDuration = 8; 
-        const outputName = `clip_${i}.mp4`;
+        const clipDuration = 10;
+        const outputName = `clip_${i}.${isAudioOnly ? extension : 'mp4'}`;
         
-        await ffmpeg.exec([
-          '-ss', start.toString(), 
-          '-i', 'input.mp4', 
-          '-t', clipDuration.toString(), 
-          '-c:v', 'copy', 
-          '-c:a', 'copy', 
-          outputName
-        ]);
-        
-        const data = await ffmpeg.readFile(outputName);
-        const blob = new Blob([data], { type: 'video/mp4' });
-        updatedHighlights[i] = { ...h, clipUrl: URL.createObjectURL(blob) };
+        try {
+          await ffmpeg.exec(['-ss', start.toString(), '-i', inputFileName, '-t', clipDuration.toString(), '-c', 'copy', outputName]);
+          const data = await ffmpeg.readFile(outputName);
+          const blob = new Blob([data], { type: isAudioOnly ? file.type : 'video/mp4' });
+          updatedHighlights[i] = { ...h, clipBlob: blob, clipUrl: URL.createObjectURL(blob) };
+        } catch (e) {
+          console.warn(`Clip ${i} generation skipped.`);
+        }
         setClippingProgress(Math.round(((i + 1) / updatedHighlights.length) * 100));
       }
       return { ...analysis, highlights: updatedHighlights };
     } catch (err) {
-      console.error("[FFmpeg] Clipping failed:", err);
+      console.warn("FFmpeg runtime error, proceeding with analysis only.");
       return analysis;
     }
   };
 
   const startAnalysis = async () => {
     if (!videoFile) return;
+    setError(null);
     const fileId = getFileId(videoFile);
-    
-    // Check Cache first
     const cached = history.find(item => item.id === fileId);
+    
     if (cached) {
-      console.log("[Cache] Found existing analysis for this video.");
-      setStatus(AnalysisStatus.CLIPPING);
-      const restoredWithClips = await generateClips(cached.result, videoFile);
-      setResults(restoredWithClips);
+      const restored = await generateClips(cached.result, videoFile);
+      setResults(restored);
       setStatus(AnalysisStatus.COMPLETED);
       return;
     }
@@ -145,20 +158,18 @@ const App: React.FC = () => {
         reader.readAsDataURL(videoFile);
       });
       const base64 = await base64Promise;
-
+      
       setStatus(AnalysisStatus.ANALYZING);
       let analysis = await analyzeVideo(base64, videoFile.type);
       
-      // Save to history (without Blob URLs since they expire)
-      const historyItem: HistoryItem = {
-        id: fileId,
-        fileName: videoFile.name,
-        timestamp: Date.now(),
-        result: analysis
+      const historyItem: HistoryItem = { 
+        id: fileId, 
+        fileName: videoFile.name, 
+        timestamp: Date.now(), 
+        result: analysis 
       };
       setHistory(prev => [historyItem, ...prev.filter(h => h.id !== fileId)].slice(0, 10));
-
-      // Generate actual clips
+      
       analysis = await generateClips(analysis, videoFile);
       setResults(analysis);
       setStatus(AnalysisStatus.COMPLETED);
@@ -168,38 +179,38 @@ const App: React.FC = () => {
     }
   };
 
-  const handleHistoryClick = (item: HistoryItem) => {
-    // In a real scenario, we'd need the user to pick the file again to get the data
-    // because we can't store large video files in localStorage.
-    setError("To view history, please upload the original file again. We will automatically restore the AI analysis.");
+  const handleSaveToGallery = async (highlight: Highlight) => {
+    if (!videoFile) return;
+    const id = `${getFileId(videoFile)}-${highlight.timestampSeconds}`;
+    const galleryItem: GalleryItem = { ...highlight, id, sourceFileName: videoFile.name, savedAt: Date.now() };
+
+    try {
+      await saveToGallery(galleryItem);
+      setGallery(prev => [...prev.filter(i => i.id !== id), { ...galleryItem, clipUrl: highlight.clipUrl }]);
+    } catch (e) { setError("Storage full."); }
+  };
+
+  const handleRemoveFromGallery = async (id: string) => {
+    await removeFromGallery(id);
+    setGallery(prev => prev.filter(i => i.id !== id));
   };
 
   const jumpToHighlight = (seconds: number) => {
     if (videoRef.current) {
-      const adjustedTime = Math.max(0, seconds - 2);
-      (videoRef.current as any).currentTime = adjustedTime;
-      (videoRef.current as any).play();
+      videoRef.current.currentTime = Math.max(0, seconds - 2);
+      videoRef.current.play();
     }
   };
 
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const updateTime = () => setCurrentTime((video as any).currentTime);
-    const updateDuration = () => setDuration((video as any).duration);
-    (video as any).addEventListener('timeupdate', updateTime);
-    (video as any).addEventListener('loadedmetadata', updateDuration);
-    return () => {
-      (video as any).removeEventListener('timeupdate', updateTime);
-      (video as any).removeEventListener('loadedmetadata', updateDuration);
-    };
-  }, [videoUrl]);
+  const handleLoadedMetadata = () => { if (videoRef.current) setDuration(videoRef.current.duration); };
+  const handleTimeUpdate = () => { if (videoRef.current) setCurrentTime(videoRef.current.currentTime); };
 
   if (!hasKey) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center space-y-8">
-        <h2 className="text-3xl font-bold text-white">Gemini API Access Required</h2>
-        <button onClick={async () => { await (window as any).aistudio.openSelectKey(); setHasKey(true); }} className="px-10 py-5 bg-indigo-600 rounded-2xl font-bold">Select API Key</button>
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center">
+        <div className="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center mb-6 shadow-2xl"><i className="fas fa-key text-white text-2xl"></i></div>
+        <h2 className="text-2xl font-bold mb-4">Gemini API Key Required</h2>
+        <button onClick={async () => { await (window as any).aistudio.openSelectKey(); setHasKey(true); }} className="px-10 py-5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold shadow-xl">Select API Key</button>
       </div>
     );
   }
@@ -208,176 +219,109 @@ const App: React.FC = () => {
     <div className="min-h-screen flex flex-col bg-slate-950 text-slate-200">
       <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <i className="fas fa-eye text-white text-xl"></i>
+          <div className="flex items-center gap-8">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg"><i className="fas fa-eye text-white text-xl"></i></div>
+              <h1 className="text-xl font-bold text-white">ScoreVision AI</h1>
             </div>
-            <h1 className="text-xl font-bold bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">Clipp3</h1>
+            <nav className="flex items-center gap-1 bg-slate-800/50 p-1 rounded-lg">
+              <button onClick={() => setActiveTab('analysis')} className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'analysis' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'}`}>Analysis</button>
+              <button onClick={() => setActiveTab('gallery')} className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'gallery' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'}`}>Gallery</button>
+            </nav>
           </div>
-          
           <div className="flex items-center gap-4">
-            <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                <i className="fas fa-tshirt text-slate-500 group-focus-within:text-indigo-400 transition-colors"></i>
-              </div>
+            <div className="relative">
+              <i className="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+              {/* Fix: Explicitly cast event handler to access input value safely */}
               <input 
                 type="text" 
-                placeholder="Target Jersey #" 
-                value={targetJersey}
-                // Cast e.target to HTMLInputElement to fix property existence error on EventTarget
-                onChange={(e) => setTargetJersey((e.target as HTMLInputElement).value)}
-                className="bg-slate-800 border border-slate-700 rounded-lg pl-9 pr-4 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all w-32 md:w-48"
+                placeholder="Jersey #" 
+                value={targetJersey} 
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetJersey(e.target.value)} 
+                className="bg-slate-800 border border-slate-700 rounded-lg pl-8 pr-4 py-1.5 text-sm outline-none w-32 md:w-48" 
               />
             </div>
-            {videoFile && (
-              <button 
-                onClick={() => { setVideoFile(null); setResults(null); setStatus(AnalysisStatus.IDLE); setVideoUrl(null); }}
-                className="text-sm font-medium text-slate-400 hover:text-white transition-colors bg-slate-800/50 px-4 py-2 rounded-lg"
-              >
-                New Video
-              </button>
-            )}
+            {videoFile && <button onClick={() => { setVideoFile(null); setResults(null); setStatus(AnalysisStatus.IDLE); }} className="text-xs text-slate-400 hover:text-white underline">Reset</button>}
           </div>
         </div>
       </header>
 
       <main className="flex-1 max-w-7xl mx-auto w-full p-4 lg:p-8">
-        {!videoFile ? (
-          <div className="space-y-12">
-            <div className="h-[40vh] flex flex-col items-center justify-center">
-              <div className="w-full max-w-2xl text-center space-y-8">
-                <h2 className="text-4xl lg:text-5xl font-extrabold tracking-tight text-white">Match Analysis <span className="text-indigo-500">Simplified.</span></h2>
-                <label className="group relative block w-full aspect-video md:aspect-[21/9] rounded-3xl border-2 border-dashed border-slate-700 bg-slate-800/20 hover:bg-slate-800/40 hover:border-indigo-500 transition-all cursor-pointer shadow-inner">
-                  <input type="file" accept="video/*" onChange={(e: any) => { const file = e.target.files?.[0]; if (file) { setVideoFile(file); setVideoUrl(URL.createObjectURL(file)); } }} className="hidden" />
-                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-                    <div className="w-16 h-16 bg-slate-800 rounded-2xl flex items-center justify-center group-hover:scale-110 group-hover:bg-indigo-600 transition-all shadow-xl"><i className="fas fa-clapperboard text-2xl text-slate-400 group-hover:text-white"></i></div>
-                    <p className="text-xl font-semibold text-white">Upload Sports Video</p>
-                  </div>
-                </label>
-              </div>
+        {activeTab === 'analysis' ? (
+          !videoFile ? (
+            <div className="h-[60vh] flex flex-col items-center justify-center text-center">
+              <h2 className="text-4xl font-extrabold text-white mb-4">Smart Match Analysis</h2>
+              <p className="text-slate-500 mb-8 max-w-md">Identify scorers, jersey numbers, and key events automatically with Gemini AI.</p>
+              <label className="w-full max-w-xl aspect-video rounded-3xl border-2 border-dashed border-slate-700 bg-slate-800/20 flex flex-col items-center justify-center cursor-pointer hover:border-indigo-500 transition-all">
+                <input type="file" accept="video/*,audio/*" onChange={(e: any) => { const file = e.target.files?.[0]; if (file) { setVideoFile(file); setVideoUrl(URL.createObjectURL(file)); setStatus(AnalysisStatus.IDLE); setResults(null); } }} className="hidden" />
+                <div className="w-16 h-16 bg-slate-800 rounded-2xl flex items-center justify-center mb-4"><i className="fas fa-upload text-slate-400"></i></div>
+                <p className="text-lg font-bold text-white">Click to Upload Match</p>
+              </label>
             </div>
-
-            {history.length > 0 && (
-              <div className="max-w-4xl mx-auto">
-                <h3 className="text-lg font-bold text-slate-400 mb-4 flex items-center gap-2">
-                  <i className="fas fa-history"></i> Recent Analyses
-                </h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {history.map((item) => (
-                    <div 
-                      key={item.id}
-                      onClick={() => handleHistoryClick(item)}
-                      className="p-4 bg-slate-900 border border-slate-800 rounded-xl hover:border-indigo-500 transition-all cursor-pointer flex justify-between items-center group"
-                    >
-                      <div>
-                        <p className="font-semibold text-slate-200 group-hover:text-indigo-400 transition-colors">{item.fileName}</p>
-                        <p className="text-xs text-slate-500">{new Date(item.timestamp).toLocaleDateString()} • {item.result.highlights.length} Highlights</p>
-                      </div>
-                      <i className="fas fa-chevron-right text-slate-700 group-hover:text-indigo-500"></i>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            <div className="lg:col-span-8 space-y-6">
-              <div className="relative aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800 ring-1 ring-slate-700">
-                {videoUrl && <video ref={videoRef} src={videoUrl} className="w-full h-full" controls />}
-                {(status === AnalysisStatus.ANALYZING || status === AnalysisStatus.CLIPPING || status === AnalysisStatus.UPLOADING) && (
-                  <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center z-20 text-center p-8">
-                    <div className="w-24 h-24 mb-6 relative">
-                      <div className="absolute inset-0 border-4 border-indigo-500/10 rounded-full animate-pulse"></div>
-                      <div className="absolute inset-0 border-4 border-indigo-500 rounded-full border-t-transparent animate-spin"></div>
-                      <i className={`fas ${status === AnalysisStatus.ANALYZING ? 'fa-brain' : status === AnalysisStatus.CLIPPING ? 'fa-scissors' : 'fa-upload'} text-indigo-500 text-3xl absolute inset-0 flex items-center justify-center`}></i>
-                    </div>
-                    <h3 className="text-2xl font-bold mb-2 text-white">
-                      {status === AnalysisStatus.UPLOADING && 'Reading Video File...'}
-                      {status === AnalysisStatus.ANALYZING && 'AI Analyzing Match...'}
-                      {status === AnalysisStatus.CLIPPING && 'Extracting Highlights...'}
-                    </h3>
-                    {status === AnalysisStatus.CLIPPING && (
-                      <div className="mt-6 w-full max-w-xs bg-slate-800 h-2 rounded-full overflow-hidden">
-                        <div className="bg-indigo-500 h-full transition-all duration-300" style={{ width: `${clippingProgress}%` }}></div>
-                      </div>
-                    )}
-                    <p className="text-slate-500 text-sm mt-4">
-                      {status === AnalysisStatus.CLIPPING ? `Generating ${clippingProgress}% complete` : 'Please keep this tab open.'}
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {status === AnalysisStatus.COMPLETED && duration > 0 && (
-                <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-800 shadow-xl">
-                  <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-lg font-bold flex items-center gap-2 text-white">
-                      <i className="fas fa-layer-group text-indigo-500"></i> Event Timeline
-                    </h3>
-                    {targetJersey && (
-                      <span className="text-xs font-bold text-indigo-400 uppercase tracking-widest">
-                        Filtering Player #{targetJersey}
-                      </span>
-                    )}
-                  </div>
-                  <Timeline duration={duration} currentTime={currentTime} highlights={filteredHighlights} onMarkerClick={jumpToHighlight} />
-                </div>
-              )}
-
-              {status === AnalysisStatus.IDLE && (
-                <div className="flex justify-center pt-4">
-                  <button onClick={startAnalysis} className="px-10 py-5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold shadow-2xl transition-all transform hover:-translate-y-1 hover:scale-105">
-                    Start AI Analysis
-                  </button>
-                </div>
-              )}
-
-              {error && (
-                <div className="p-5 bg-rose-500/10 border border-rose-500/50 rounded-2xl text-rose-500 flex items-center gap-4 animate-shake">
-                  <i className="fas fa-exclamation-circle"></i>
-                  <span className="text-sm font-medium">{error}</span>
-                </div>
-              )}
-            </div>
-
-            <div className="lg:col-span-4 flex flex-col">
-              <div className="bg-slate-900/50 border border-slate-800 rounded-2xl flex flex-col h-full shadow-2xl overflow-hidden sticky top-24 max-h-[calc(100vh-8rem)]">
-                <div className="p-6 border-b border-slate-800 bg-slate-800/20 flex items-center justify-between">
-                  <h3 className="font-bold text-lg text-white">
-                    {targetJersey ? `Player #${targetJersey}` : 'Highlights'}
-                  </h3>
-                  <span className="bg-indigo-600 text-white px-3 py-1 rounded-full text-xs font-bold">
-                    {filteredHighlights.length} Clips
-                  </span>
-                </div>
-                
-                <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
-                  {status === AnalysisStatus.COMPLETED ? (
-                    filteredHighlights.length === 0 ? (
-                      <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 p-8">
-                        <i className="fas fa-search text-2xl mb-4"></i>
-                        <p>No results for this player.</p>
-                      </div>
-                    ) : (
-                      filteredHighlights.map((h, i) => (
-                        <HighlightCard 
-                          key={i} 
-                          highlight={h} 
-                          isActive={Math.abs(currentTime - h.timestampSeconds) < 1.5} 
-                          onClick={() => jumpToHighlight(h.timestampSeconds)} 
-                        />
-                      ))
-                    )
-                  ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 p-8 space-y-4">
-                      <i className="fas fa-video text-xl opacity-20"></i>
-                      <p className="text-sm italic">Analysis required to see event logs.</p>
+          ) : (
+            <div className="grid lg:grid-cols-12 gap-8">
+              <div className="lg:col-span-8 space-y-6">
+                <div className="relative aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800">
+                  {videoUrl && (
+                    videoFile.type.startsWith('audio/') ? 
+                    <audio ref={videoRef} src={videoUrl} onLoadedMetadata={handleLoadedMetadata} onTimeUpdate={handleTimeUpdate} className="w-full absolute bottom-4 px-8" controls /> : 
+                    <video ref={videoRef} src={videoUrl} onLoadedMetadata={handleLoadedMetadata} onTimeUpdate={handleTimeUpdate} className="w-full h-full" controls />
+                  )}
+                  {status !== AnalysisStatus.IDLE && status !== AnalysisStatus.COMPLETED && status !== AnalysisStatus.ERROR && (
+                    <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-8 z-30">
+                      <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                      <h3 className="text-xl font-bold">{status === AnalysisStatus.ANALYZING ? 'AI is Watching...' : 'Polishing Highlights...'}</h3>
+                      {status === AnalysisStatus.CLIPPING && (
+                        <div className="w-full max-w-xs bg-slate-800 h-1.5 rounded-full mt-4 overflow-hidden">
+                          <div className="bg-indigo-500 h-full transition-all" style={{ width: `${clippingProgress}%` }}></div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
+                {status === AnalysisStatus.COMPLETED && (
+                  <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-800">
+                    <Timeline duration={duration} currentTime={currentTime} highlights={filteredHighlights} onMarkerClick={jumpToHighlight} />
+                  </div>
+                )}
+                {status === AnalysisStatus.IDLE && (
+                   <div className="flex justify-center"><button onClick={startAnalysis} className="px-10 py-5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold shadow-xl">Analyze Performance</button></div>
+                )}
+              </div>
+              <div className="lg:col-span-4">
+                <div className="bg-slate-900/50 border border-slate-800 rounded-2xl flex flex-col h-[calc(100vh-12rem)] sticky top-24">
+                  <div className="p-5 border-b border-slate-800 flex justify-between items-center">
+                    <h3 className="font-bold">Match Log</h3>
+                    {clippingSupported === false && <span className="text-[10px] text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">Manual Playback</span>}
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+                    {status === AnalysisStatus.COMPLETED ? (
+                      filteredHighlights.map((h, i) => (
+                        <HighlightCard 
+                          key={i} highlight={h} 
+                          isActive={Math.abs(currentTime - h.timestampSeconds) < 2.0} 
+                          isSaved={gallery.some(g => g.id === `${getFileId(videoFile!)}-${h.timestampSeconds}`)}
+                          onSave={() => handleSaveToGallery(h)}
+                          onRemove={() => handleRemoveFromGallery(`${getFileId(videoFile!)}-${h.timestampSeconds}`)}
+                          onClick={() => jumpToHighlight(h.timestampSeconds)} 
+                        />
+                      ))
+                    ) : (
+                      <p className="text-center text-slate-600 italic py-12">Start analysis to see events.</p>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
+          )
+        ) : (
+          <div className="space-y-6">
+            <h2 className="text-3xl font-bold">Your Gallery</h2>
+            {gallery.length === 0 ? <p className="text-slate-500">No saved highlights.</p> : (
+              <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {filteredGallery.map((item) => <HighlightCard key={item.id} highlight={item} isActive={false} isSaved={true} onRemove={() => handleRemoveFromGallery(item.id)} onClick={() => {}} sourceInfo={item.sourceFileName} />)}
+              </div>
+            )}
           </div>
         )}
       </main>

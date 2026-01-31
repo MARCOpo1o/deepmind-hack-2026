@@ -3,8 +3,8 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App.tsx';
 
-// Use window.document to satisfy environment checks where 'document' might not be globally recognized
-const rootElement = window.document.getElementById('root');
+// Fix: Cast window to any to access document, satisfying environment checks where standard types might be incomplete
+const rootElement = (window as any).document.getElementById('root');
 if (!rootElement) {
   throw new Error("Could not find root element to mount to");
 }

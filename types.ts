@@ -7,12 +7,19 @@ export interface Highlight {
   intensity: 'High' | 'Medium' | 'Low';
   playerJerseyNumber?: string;
   clipUrl?: string; 
+  clipBlob?: Blob; // Store the raw blob for DB saving
+}
+
+export interface GalleryItem extends Highlight {
+  id: string; // Unique ID (e.g., videoId + timestamp)
+  sourceFileName: string;
+  savedAt: number;
 }
 
 export interface AnalysisResult {
   highlights: Highlight[];
   summary: string;
-  videoId?: string; // Cache key
+  videoId?: string; 
 }
 
 export interface HistoryItem {
