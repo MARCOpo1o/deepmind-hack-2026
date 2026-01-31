@@ -3,7 +3,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { AnalysisResult } from "../types.ts";
 
 export const analyzeVideo = async (videoBase64: string, mimeType: string): Promise<AnalysisResult> => {
-  console.log("[ScoreVision AI] Starting deep analysis...");
+  console.log("[Clip3 AI] Starting deep analysis...");
   
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const modelName = 'gemini-3-pro-preview';
@@ -79,7 +79,12 @@ export const analyzeVideo = async (videoBase64: string, mimeType: string): Promi
     return parsed as AnalysisResult;
 
   } catch (error: any) {
-    console.error("[ScoreVision AI] API Error:", error);
+    console.error("[Clip3 AI] API Error:", error);
+    if (error.message?.includes("Requested entity was not found")) {
+      if ((window as any).aistudio?.openSelectKey) {
+        (window as any).aistudio.openSelectKey();
+      }
+    }
     if (error.message?.includes("400")) {
       throw new Error("Video too large or format unsupported. Try a smaller clip.");
     }
@@ -110,6 +115,11 @@ export const queryVideo = async (videoBase64: string, mimeType: string, query: s
     });
     return response.text || "No insights.";
   } catch (error: any) {
+    if (error.message?.includes("Requested entity was not found")) {
+      if ((window as any).aistudio?.openSelectKey) {
+        (window as any).aistudio.openSelectKey();
+      }
+    }
     throw error;
   }
 };

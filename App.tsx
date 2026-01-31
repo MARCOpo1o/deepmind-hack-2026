@@ -8,7 +8,7 @@ import HighlightCard from './components/HighlightCard.tsx';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
-const CACHE_KEY = 'scorevision_history_v1';
+const CACHE_KEY = 'clip3_history_v1';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'analysis' | 'gallery'>('analysis');
@@ -24,7 +24,7 @@ const App: React.FC = () => {
   const [clippingProgress, setClippingProgress] = useState(0);
   const [targetJersey, setTargetJersey] = useState<string>('');
   const [hasKey, setHasKey] = useState(false);
-  const [clippingSupported, setClippingSupported] = useState<boolean | null>(null);
+  const [isEngineAvailable, setIsEngineAvailable] = useState<boolean | null>(null);
 
   const videoRef = useRef<any>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
@@ -75,9 +75,10 @@ const App: React.FC = () => {
     return gallery.filter(h => h.playerJerseyNumber?.toLowerCase().includes(targetJersey.trim().toLowerCase()));
   }, [gallery, targetJersey]);
 
-  const loadFFmpeg = async () => {
+  const tryLoadFFmpeg = async () => {
     if (ffmpegRef.current) return ffmpegRef.current;
-    
+    if (isEngineAvailable === false) return null;
+
     const ffmpeg = new FFmpeg();
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
     
@@ -88,11 +89,11 @@ const App: React.FC = () => {
         workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
       });
       ffmpegRef.current = ffmpeg;
-      setClippingSupported(true);
+      setIsEngineAvailable(true);
       return ffmpeg;
     } catch (err) {
-      console.warn("[ScoreVision] Video engine disabled: Browser security restricts SharedArrayBuffer.");
-      setClippingSupported(false);
+      console.warn("[Clip3] Video engine disabled. Clipping skipped due to browser security restrictions.");
+      setIsEngineAvailable(false);
       return null;
     }
   };
@@ -100,8 +101,8 @@ const App: React.FC = () => {
   const generateClips = async (analysis: AnalysisResult, file: File) => {
     if (!analysis.highlights.length) return analysis;
     
-    const ffmpeg = await loadFFmpeg();
-    if (!ffmpeg) return analysis; // Silently skip clipping if engine is blocked
+    const ffmpeg = await tryLoadFFmpeg();
+    if (!ffmpeg) return analysis;
 
     setStatus(AnalysisStatus.CLIPPING);
     setClippingProgress(0);
@@ -126,13 +127,13 @@ const App: React.FC = () => {
           const blob = new Blob([data], { type: isAudioOnly ? file.type : 'video/mp4' });
           updatedHighlights[i] = { ...h, clipBlob: blob, clipUrl: URL.createObjectURL(blob) };
         } catch (e) {
-          console.warn(`Clip ${i} generation skipped.`);
+          console.debug(`Clip ${i} could not be generated.`);
         }
         setClippingProgress(Math.round(((i + 1) / updatedHighlights.length) * 100));
       }
       return { ...analysis, highlights: updatedHighlights };
     } catch (err) {
-      console.warn("FFmpeg runtime error, proceeding with analysis only.");
+      console.warn("Clip generation failed, but analysis is intact.");
       return analysis;
     }
   };
@@ -222,7 +223,7 @@ const App: React.FC = () => {
           <div className="flex items-center gap-8">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg"><i className="fas fa-eye text-white text-xl"></i></div>
-              <h1 className="text-xl font-bold text-white">ScoreVision AI</h1>
+              <h1 className="text-xl font-bold text-white">Clip3</h1>
             </div>
             <nav className="flex items-center gap-1 bg-slate-800/50 p-1 rounded-lg">
               <button onClick={() => setActiveTab('analysis')} className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${activeTab === 'analysis' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'}`}>Analysis</button>
@@ -232,12 +233,12 @@ const App: React.FC = () => {
           <div className="flex items-center gap-4">
             <div className="relative">
               <i className="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
-              {/* Fix: Explicitly cast event handler to access input value safely */}
               <input 
                 type="text" 
                 placeholder="Jersey #" 
                 value={targetJersey} 
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetJersey(e.target.value)} 
+                // Fix: Using e.currentTarget.value to resolve potential TypeScript narrowing issues where e.target might not be correctly recognized as HTMLInputElement
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetJersey(e.currentTarget.value)} 
                 className="bg-slate-800 border border-slate-700 rounded-lg pl-8 pr-4 py-1.5 text-sm outline-none w-32 md:w-48" 
               />
             </div>
@@ -253,7 +254,8 @@ const App: React.FC = () => {
               <h2 className="text-4xl font-extrabold text-white mb-4">Smart Match Analysis</h2>
               <p className="text-slate-500 mb-8 max-w-md">Identify scorers, jersey numbers, and key events automatically with Gemini AI.</p>
               <label className="w-full max-w-xl aspect-video rounded-3xl border-2 border-dashed border-slate-700 bg-slate-800/20 flex flex-col items-center justify-center cursor-pointer hover:border-indigo-500 transition-all">
-                <input type="file" accept="video/*,audio/*" onChange={(e: any) => { const file = e.target.files?.[0]; if (file) { setVideoFile(file); setVideoUrl(URL.createObjectURL(file)); setStatus(AnalysisStatus.IDLE); setResults(null); } }} className="hidden" />
+                {/* Fix: Replaced e: any with React.ChangeEvent<HTMLInputElement> and used currentTarget.files to resolve potential property access errors */}
+                <input type="file" accept="video/*,audio/*" onChange={(e: React.ChangeEvent<HTMLInputElement>) => { const file = e.currentTarget.files?.[0]; if (file) { setVideoFile(file); setVideoUrl(URL.createObjectURL(file)); setStatus(AnalysisStatus.IDLE); setResults(null); } }} className="hidden" />
                 <div className="w-16 h-16 bg-slate-800 rounded-2xl flex items-center justify-center mb-4"><i className="fas fa-upload text-slate-400"></i></div>
                 <p className="text-lg font-bold text-white">Click to Upload Match</p>
               </label>
@@ -270,7 +272,7 @@ const App: React.FC = () => {
                   {status !== AnalysisStatus.IDLE && status !== AnalysisStatus.COMPLETED && status !== AnalysisStatus.ERROR && (
                     <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-8 z-30">
                       <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
-                      <h3 className="text-xl font-bold">{status === AnalysisStatus.ANALYZING ? 'AI is Watching...' : 'Polishing Highlights...'}</h3>
+                      <h3 className="text-xl font-bold">{status === AnalysisStatus.ANALYZING ? 'AI is Watching...' : 'Analyzing Match Flow...'}</h3>
                       {status === AnalysisStatus.CLIPPING && (
                         <div className="w-full max-w-xs bg-slate-800 h-1.5 rounded-full mt-4 overflow-hidden">
                           <div className="bg-indigo-500 h-full transition-all" style={{ width: `${clippingProgress}%` }}></div>
@@ -287,27 +289,35 @@ const App: React.FC = () => {
                 {status === AnalysisStatus.IDLE && (
                    <div className="flex justify-center"><button onClick={startAnalysis} className="px-10 py-5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold shadow-xl">Analyze Performance</button></div>
                 )}
+                {error && (
+                  <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-500 text-sm flex items-center gap-3">
+                    <i className="fas fa-exclamation-triangle"></i>
+                    <p>{error}</p>
+                  </div>
+                )}
               </div>
               <div className="lg:col-span-4">
                 <div className="bg-slate-900/50 border border-slate-800 rounded-2xl flex flex-col h-[calc(100vh-12rem)] sticky top-24">
                   <div className="p-5 border-b border-slate-800 flex justify-between items-center">
                     <h3 className="font-bold">Match Log</h3>
-                    {clippingSupported === false && <span className="text-[10px] text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">Manual Playback</span>}
+                    {isEngineAvailable === false && status === AnalysisStatus.COMPLETED && <span className="text-[10px] text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">Sync Only</span>}
                   </div>
                   <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
                     {status === AnalysisStatus.COMPLETED ? (
-                      filteredHighlights.map((h, i) => (
-                        <HighlightCard 
-                          key={i} highlight={h} 
-                          isActive={Math.abs(currentTime - h.timestampSeconds) < 2.0} 
-                          isSaved={gallery.some(g => g.id === `${getFileId(videoFile!)}-${h.timestampSeconds}`)}
-                          onSave={() => handleSaveToGallery(h)}
-                          onRemove={() => handleRemoveFromGallery(`${getFileId(videoFile!)}-${h.timestampSeconds}`)}
-                          onClick={() => jumpToHighlight(h.timestampSeconds)} 
-                        />
-                      ))
+                      filteredHighlights.length > 0 ? (
+                        filteredHighlights.map((h, i) => (
+                          <HighlightCard 
+                            key={i} highlight={h} 
+                            isActive={Math.abs(currentTime - h.timestampSeconds) < 2.0} 
+                            isSaved={gallery.some(g => g.id === `${getFileId(videoFile!)}-${h.timestampSeconds}`)}
+                            onSave={() => handleSaveToGallery(h)}
+                            onRemove={() => handleRemoveFromGallery(`${getFileId(videoFile!)}-${h.timestampSeconds}`)}
+                            onClick={() => jumpToHighlight(h.timestampSeconds)} 
+                          />
+                        ))
+                      ) : <p className="text-center text-slate-600 italic py-12">No events found.</p>
                     ) : (
-                      <p className="text-center text-slate-600 italic py-12">Start analysis to see events.</p>
+                      <p className="text-center text-slate-600 italic py-12">Waiting for analysis...</p>
                     )}
                   </div>
                 </div>
