@@ -7,11 +7,11 @@ export interface Highlight {
   intensity: 'High' | 'Medium' | 'Low';
   playerJerseyNumber?: string;
   clipUrl?: string; 
-  clipBlob?: Blob; // Store the raw blob for DB saving
+  clipBlob?: Blob; 
 }
 
 export interface GalleryItem extends Highlight {
-  id: string; // Unique ID (e.g., videoId + timestamp)
+  id: string; 
   sourceFileName: string;
   savedAt: number;
 }
@@ -32,6 +32,7 @@ export interface HistoryItem {
 export enum AnalysisStatus {
   IDLE = 'IDLE',
   UPLOADING = 'UPLOADING',
+  SAMPLING = 'SAMPLING',
   ANALYZING = 'ANALYZING',
   CLIPPING = 'CLIPPING',
   COMPLETED = 'COMPLETED',

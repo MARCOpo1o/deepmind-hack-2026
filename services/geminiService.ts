@@ -2,49 +2,48 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { AnalysisResult } from "../types.ts";
 
-export const analyzeVideo = async (videoBase64: string, mimeType: string): Promise<AnalysisResult> => {
-  console.log("[Clip3 AI] Starting deep analysis...");
+export const analyzeVideo = async (parts: any[]): Promise<AnalysisResult> => {
+  console.log("[Clip3 AI] Analyzing sampled match frames...");
   
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const modelName = 'gemini-3-pro-preview';
+  const modelName = 'gemini-3-flash-preview';
 
   const systemInstruction = `
     You are an elite sports broadcast analyst. 
-    Analyze the provided video and identify every significant scoring event.
+    You will be provided with a sequence of frames sampled from a sports video.
     
-    For each event, you MUST identify:
-    1. timestampSeconds: The float timestamp of the score.
-    2. displayTime: MM:SS format.
-    3. description: A 1-sentence exciting description.
-    4. scoreType: e.g. 'Goal', '3-Pointer', 'Touchdown'.
-    5. intensity: 'High', 'Medium', or 'Low'.
-    6. playerJerseyNumber: THE MOST IMPORTANT PART. Identify the jersey number of the player who scored. 
-       Look closely at their back or chest during the celebration or the play. 
-       Return just the number (e.g. "10", "7", "23"). 
-       If absolutely impossible to see, return "Unknown".
+    TASK:
+    1. Identify every scoring event visible in the frames.
+    2. Provide an accurate timestamp for each score.
+    3. Identify the jersey number of the player who scored.
+    4. Provide an exciting description of the play.
     
-    Return the data strictly as a single JSON object.
+    JSON SCHEMA REQUIREMENTS:
+    - highlights: array of objects
+      - timestampSeconds: float (the actual time in the video)
+      - displayTime: MM:SS format
+      - description: 1-sentence highlight description
+      - scoreType: e.g. 'Goal', '3-Pointer', 'Touchdown'
+      - intensity: 'High', 'Medium', or 'Low'
+      - playerJerseyNumber: the scorer's jersey number (e.g. "7", "23") or "Unknown"
+    - summary: a brief match summary
+    
+    Return ONLY a single valid JSON object.
   `;
 
   try {
     const response = await ai.models.generateContent({
       model: modelName,
-      contents: [
-        {
-          parts: [
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: videoBase64
-              }
-            },
-            { text: "Identify all scores and the jersey numbers of the scorers in JSON format." }
-          ]
-        }
-      ],
+      contents: {
+        parts: [
+          ...parts,
+          { text: "Examine these frames sequentially and find all scoring moments. Return the results in JSON format." }
+        ]
+      },
       config: {
         systemInstruction: systemInstruction,
         responseMimeType: "application/json",
+        thinkingConfig: { thinkingBudget: 2048 },
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -60,14 +59,12 @@ export const analyzeVideo = async (videoBase64: string, mimeType: string): Promi
                   intensity: { type: Type.STRING },
                   playerJerseyNumber: { type: Type.STRING }
                 },
-                required: ["timestampSeconds", "displayTime", "description", "scoreType", "intensity", "playerJerseyNumber"],
-                propertyOrdering: ["timestampSeconds", "displayTime", "description", "scoreType", "intensity", "playerJerseyNumber"]
+                required: ["timestampSeconds", "displayTime", "description", "scoreType", "intensity", "playerJerseyNumber"]
               }
             },
             summary: { type: Type.STRING }
           },
-          required: ["highlights", "summary"],
-          propertyOrdering: ["highlights", "summary"]
+          required: ["highlights", "summary"]
         }
       }
     });
@@ -80,46 +77,13 @@ export const analyzeVideo = async (videoBase64: string, mimeType: string): Promi
 
   } catch (error: any) {
     console.error("[Clip3 AI] API Error:", error);
+    
     if (error.message?.includes("Requested entity was not found")) {
       if ((window as any).aistudio?.openSelectKey) {
         (window as any).aistudio.openSelectKey();
       }
     }
-    if (error.message?.includes("400")) {
-      throw new Error("Video too large or format unsupported. Try a smaller clip.");
-    }
-    throw error;
-  }
-};
-
-export const queryVideo = async (videoBase64: string, mimeType: string, query: string): Promise<string> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const modelName = 'gemini-3-pro-preview';
-
-  try {
-    const response = await ai.models.generateContent({
-      model: modelName,
-      contents: [
-        {
-          parts: [
-            { inlineData: { mimeType, data: videoBase64 } },
-            { text: query }
-          ]
-        }
-      ],
-      config: {
-        systemInstruction: "You are an AI sports analyst. Be concise.",
-        maxOutputTokens: 1024,
-        thinkingConfig: { thinkingBudget: 512 }
-      }
-    });
-    return response.text || "No insights.";
-  } catch (error: any) {
-    if (error.message?.includes("Requested entity was not found")) {
-      if ((window as any).aistudio?.openSelectKey) {
-        (window as any).aistudio.openSelectKey();
-      }
-    }
+    
     throw error;
   }
 };

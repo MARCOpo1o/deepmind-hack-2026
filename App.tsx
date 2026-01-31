@@ -8,7 +8,8 @@ import HighlightCard from './components/HighlightCard.tsx';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
-const CACHE_KEY = 'clip3_history_v1';
+const CACHE_KEY = 'clip3_history_v3';
+const TARGET_FRAME_COUNT = 100; // Total frames to send to AI
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'analysis' | 'gallery'>('analysis');
@@ -22,11 +23,12 @@ const App: React.FC = () => {
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [clippingProgress, setClippingProgress] = useState(0);
+  const [samplingProgress, setSamplingProgress] = useState(0);
   const [targetJersey, setTargetJersey] = useState<string>('');
   const [hasKey, setHasKey] = useState(false);
   const [isEngineAvailable, setIsEngineAvailable] = useState<boolean | null>(null);
 
-  const videoRef = useRef<any>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
 
   useEffect(() => {
@@ -63,6 +65,67 @@ const App: React.FC = () => {
   }, [history]);
 
   const getFileId = (file: File) => `${file.name}-${file.size}-${file.lastModified}`;
+
+  const sampleFrames = async (file: File): Promise<any[]> => {
+    return new Promise((resolve, reject) => {
+      // Fix: Use window.document to access document in restricted environments
+      const video = (window as any).document.createElement('video');
+      video.preload = 'metadata';
+      video.src = URL.createObjectURL(file);
+      video.muted = true;
+      video.playsInline = true;
+
+      video.onloadedmetadata = async () => {
+        const duration = video.duration;
+        const interval = duration / TARGET_FRAME_COUNT;
+        const frames: any[] = [];
+        // Fix: Use window.document to access document in restricted environments
+        const canvas = (window as any).document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // Scale down for speed and size (480p is enough for jersey numbers)
+        const scale = Math.min(1, 854 / video.videoWidth);
+        canvas.width = video.videoWidth * scale;
+        canvas.height = video.videoHeight * scale;
+
+        setStatus(AnalysisStatus.SAMPLING);
+        
+        for (let i = 0; i < TARGET_FRAME_COUNT; i++) {
+          const time = i * interval;
+          video.currentTime = time;
+          
+          await new Promise((res) => {
+            const onSeeked = () => {
+              video.removeEventListener('seeked', onSeeked);
+              res(null);
+            };
+            video.addEventListener('seeked', onSeeked);
+          });
+
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+            const base64 = dataUrl.split(',')[1];
+            
+            frames.push({
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: base64
+              }
+            });
+            // Also push a tiny piece of metadata so the AI knows the timestamp
+            frames.push({ text: `[Timestamp: ${time.toFixed(2)}s]` });
+          }
+          setSamplingProgress(Math.round(((i + 1) / TARGET_FRAME_COUNT) * 100));
+        }
+        
+        URL.revokeObjectURL(video.src);
+        resolve(frames);
+      };
+
+      video.onerror = () => reject(new Error("Failed to load video for sampling."));
+    });
+  };
 
   const filteredHighlights = useMemo(() => {
     if (!results) return [];
@@ -141,6 +204,7 @@ const App: React.FC = () => {
   const startAnalysis = async () => {
     if (!videoFile) return;
     setError(null);
+
     const fileId = getFileId(videoFile);
     const cached = history.find(item => item.id === fileId);
     
@@ -152,16 +216,13 @@ const App: React.FC = () => {
     }
 
     try {
-      setStatus(AnalysisStatus.UPLOADING);
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve) => {
-        reader.onload = () => resolve((reader.result as string).split(',')[1]);
-        reader.readAsDataURL(videoFile);
-      });
-      const base64 = await base64Promise;
+      // Step 1: Smart Sampling (Bypasses size limits by only sending visual key points)
+      setStatus(AnalysisStatus.SAMPLING);
+      const sampledParts = await sampleFrames(videoFile);
       
+      // Step 2: AI Analysis
       setStatus(AnalysisStatus.ANALYZING);
-      let analysis = await analyzeVideo(base64, videoFile.type);
+      let analysis = await analyzeVideo(sampledParts);
       
       const historyItem: HistoryItem = { 
         id: fileId, 
@@ -171,11 +232,13 @@ const App: React.FC = () => {
       };
       setHistory(prev => [historyItem, ...prev.filter(h => h.id !== fileId)].slice(0, 10));
       
+      // Step 3: Clip Generation (Local)
       analysis = await generateClips(analysis, videoFile);
       setResults(analysis);
       setStatus(AnalysisStatus.COMPLETED);
     } catch (err: any) {
-      setError(err.message || 'Analysis failed.');
+      console.error("[Clip3] Analysis Error:", err);
+      setError(err.message || 'Analysis failed. The video may be too long or in an unsupported format.');
       setStatus(AnalysisStatus.ERROR);
     }
   };
@@ -198,13 +261,16 @@ const App: React.FC = () => {
 
   const jumpToHighlight = (seconds: number) => {
     if (videoRef.current) {
-      videoRef.current.currentTime = Math.max(0, seconds - 2);
-      videoRef.current.play();
+      // Fix: Cast to any to access HTMLVideoElement properties in environment with restricted types
+      (videoRef.current as any).currentTime = Math.max(0, seconds - 2);
+      (videoRef.current as any).play();
     }
   };
 
-  const handleLoadedMetadata = () => { if (videoRef.current) setDuration(videoRef.current.duration); };
-  const handleTimeUpdate = () => { if (videoRef.current) setCurrentTime(videoRef.current.currentTime); };
+  // Fix: Cast to any to access HTMLVideoElement properties in environment with restricted types
+  const handleLoadedMetadata = () => { if (videoRef.current) setDuration((videoRef.current as any).duration); };
+  // Fix: Cast to any to access HTMLVideoElement properties in environment with restricted types
+  const handleTimeUpdate = () => { if (videoRef.current) setCurrentTime((videoRef.current as any).currentTime); };
 
   if (!hasKey) {
     return (
@@ -237,12 +303,12 @@ const App: React.FC = () => {
                 type="text" 
                 placeholder="Jersey #" 
                 value={targetJersey} 
-                // Fix: Using e.currentTarget.value to resolve potential TypeScript narrowing issues where e.target might not be correctly recognized as HTMLInputElement
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetJersey(e.currentTarget.value)} 
+                // Fix: Cast target to any to access value property
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetJersey((e.target as any).value)} 
                 className="bg-slate-800 border border-slate-700 rounded-lg pl-8 pr-4 py-1.5 text-sm outline-none w-32 md:w-48" 
               />
             </div>
-            {videoFile && <button onClick={() => { setVideoFile(null); setResults(null); setStatus(AnalysisStatus.IDLE); }} className="text-xs text-slate-400 hover:text-white underline">Reset</button>}
+            {videoFile && <button onClick={() => { setVideoFile(null); setVideoUrl(null); setResults(null); setStatus(AnalysisStatus.IDLE); setError(null); }} className="text-xs text-slate-400 hover:text-white underline">Reset</button>}
           </div>
         </div>
       </header>
@@ -252,12 +318,13 @@ const App: React.FC = () => {
           !videoFile ? (
             <div className="h-[60vh] flex flex-col items-center justify-center text-center">
               <h2 className="text-4xl font-extrabold text-white mb-4">Smart Match Analysis</h2>
-              <p className="text-slate-500 mb-8 max-w-md">Identify scorers, jersey numbers, and key events automatically with Gemini AI.</p>
+              <p className="text-slate-500 mb-8 max-w-md">Identify scorers and key events automatically. Supports large high-res videos up to 1GB.</p>
               <label className="w-full max-w-xl aspect-video rounded-3xl border-2 border-dashed border-slate-700 bg-slate-800/20 flex flex-col items-center justify-center cursor-pointer hover:border-indigo-500 transition-all">
-                {/* Fix: Replaced e: any with React.ChangeEvent<HTMLInputElement> and used currentTarget.files to resolve potential property access errors */}
-                <input type="file" accept="video/*,audio/*" onChange={(e: React.ChangeEvent<HTMLInputElement>) => { const file = e.currentTarget.files?.[0]; if (file) { setVideoFile(file); setVideoUrl(URL.createObjectURL(file)); setStatus(AnalysisStatus.IDLE); setResults(null); } }} className="hidden" />
+                {/* Fix: Cast target to any to access files property */}
+                <input type="file" accept="video/*" onChange={(e: React.ChangeEvent<HTMLInputElement>) => { const file = (e.target as any).files?.[0]; if (file) { setVideoFile(file); setVideoUrl(URL.createObjectURL(file)); setStatus(AnalysisStatus.IDLE); setResults(null); setError(null); } }} className="hidden" />
                 <div className="w-16 h-16 bg-slate-800 rounded-2xl flex items-center justify-center mb-4"><i className="fas fa-upload text-slate-400"></i></div>
                 <p className="text-lg font-bold text-white">Click to Upload Match</p>
+                <p className="text-xs text-slate-500 mt-2">Large videos are processed via smart sampling.</p>
               </label>
             </div>
           ) : (
@@ -265,19 +332,24 @@ const App: React.FC = () => {
               <div className="lg:col-span-8 space-y-6">
                 <div className="relative aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800">
                   {videoUrl && (
-                    videoFile.type.startsWith('audio/') ? 
-                    <audio ref={videoRef} src={videoUrl} onLoadedMetadata={handleLoadedMetadata} onTimeUpdate={handleTimeUpdate} className="w-full absolute bottom-4 px-8" controls /> : 
                     <video ref={videoRef} src={videoUrl} onLoadedMetadata={handleLoadedMetadata} onTimeUpdate={handleTimeUpdate} className="w-full h-full" controls />
                   )}
                   {status !== AnalysisStatus.IDLE && status !== AnalysisStatus.COMPLETED && status !== AnalysisStatus.ERROR && (
                     <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-8 z-30">
                       <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
-                      <h3 className="text-xl font-bold">{status === AnalysisStatus.ANALYZING ? 'AI is Watching...' : 'Analyzing Match Flow...'}</h3>
-                      {status === AnalysisStatus.CLIPPING && (
+                      <h3 className="text-xl font-bold">
+                        {status === AnalysisStatus.SAMPLING ? 'Extracting Key Frames...' : 
+                         status === AnalysisStatus.ANALYZING ? 'Clip3 AI is Watching...' : 
+                         'Processing...'}
+                      </h3>
+                      {(status === AnalysisStatus.SAMPLING || status === AnalysisStatus.CLIPPING) && (
                         <div className="w-full max-w-xs bg-slate-800 h-1.5 rounded-full mt-4 overflow-hidden">
-                          <div className="bg-indigo-500 h-full transition-all" style={{ width: `${clippingProgress}%` }}></div>
+                          <div className="bg-indigo-500 h-full transition-all" style={{ width: `${status === AnalysisStatus.SAMPLING ? samplingProgress : clippingProgress}%` }}></div>
                         </div>
                       )}
+                      <p className="text-xs text-slate-500 mt-2">
+                        {status === AnalysisStatus.SAMPLING ? 'Capturing visual points for AI analysis...' : 'Deducing match highlights...'}
+                      </p>
                     </div>
                   )}
                 </div>
@@ -290,8 +362,8 @@ const App: React.FC = () => {
                    <div className="flex justify-center"><button onClick={startAnalysis} className="px-10 py-5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold shadow-xl">Analyze Performance</button></div>
                 )}
                 {error && (
-                  <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-500 text-sm flex items-center gap-3">
-                    <i className="fas fa-exclamation-triangle"></i>
+                  <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-500 text-sm flex items-start gap-3">
+                    <i className="fas fa-exclamation-triangle mt-0.5"></i>
                     <p>{error}</p>
                   </div>
                 )}
@@ -317,7 +389,7 @@ const App: React.FC = () => {
                         ))
                       ) : <p className="text-center text-slate-600 italic py-12">No events found.</p>
                     ) : (
-                      <p className="text-center text-slate-600 italic py-12">Waiting for analysis...</p>
+                      <p className="text-center text-slate-600 italic py-12">{status === AnalysisStatus.ERROR ? 'Error during analysis.' : 'Waiting for analysis...'}</p>
                     )}
                   </div>
                 </div>
